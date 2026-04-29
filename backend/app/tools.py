@@ -113,8 +113,31 @@ class ToolRegistry:
         self.register("pool.add_symbol", "Add one stock to a pool.", self._pool_add_symbol, category="pool")
         self.register("pool.review", "Run a strategy against every review-enabled stock in a pool.", self._pool_review, requires_confirmation=True, category="pool")
         self.register("condition_order.create", "Create a validated condition order.", self._condition_order_create, category="condition_order")
+        self.register(
+            "condition_order.ai_create",
+            "Create a condition order from a natural-language description.",
+            self._condition_order_ai_create,
+            {"symbol": "string", "description": "string"},
+            category="condition_order",
+        )
         self.register("monitor.fetch_quotes", "Fetch realtime A-share quotes with easyquotation fallback.", self._monitor_fetch_quotes, category="monitor")
         self.register("monitor.sync_watchlist", "Sync trade plans into the intraday watchlist.", self._monitor_sync, requires_confirmation=True, category="monitor")
+        self.register("kline.update", "Update the local DuckDB K-line database.", self._kline_update, requires_confirmation=True, category="data")
+        self.register("event.cleanup", "Clean old event records.", self._event_cleanup, category="event")
+        self.register(
+            "strategy.generate",
+            "Generate a StrategySpec JSON from a natural-language description.",
+            self._strategy_generate,
+            {"name": "string", "description": "string"},
+            category="strategy",
+        )
+        self.register(
+            "strategy.explain",
+            "Explain a saved strategy in stable natural language.",
+            self._strategy_explain,
+            {"strategy_id": "number"},
+            category="strategy",
+        )
         self.register("schedule.create", "Create or update a workflow schedule.", self._schedule_create, category="schedule")
         self.register("schedule.run", "Run a saved workflow schedule immediately.", self._schedule_run, category="schedule")
         self.register("event.list", "List recent system events.", self._event_list, category="event")
@@ -144,6 +167,12 @@ class ToolRegistry:
             )
         )
         return {"screener": result.model_dump(mode="json")}
+
+    def _strategy_generate(self, args: dict[str, Any]) -> dict[str, Any]:
+        return {"strategy": self.service.generate_strategy(str(args.get("name") or "ai_strategy"), str(args.get("description") or ""))}
+
+    def _strategy_explain(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self.service.explain_strategy(int(args.get("strategy_id") or args.get("id")))
 
     def _pool_create(self, args: dict[str, Any]) -> dict[str, Any]:
         pool = StockPool(name=str(args.get("name") or "默认自选"), description=str(args.get("description") or ""))
@@ -203,6 +232,9 @@ class ToolRegistry:
         )
         return {"condition_order": self.service.repository.save_condition_order(order)}
 
+    def _condition_order_ai_create(self, args: dict[str, Any]) -> dict[str, Any]:
+        return {"condition_order": self.service.ai_create_condition_order(str(args.get("symbol") or ""), str(args.get("description") or ""))}
+
     def _monitor_sync(self, args: dict[str, Any]) -> dict[str, Any]:
         synced = self.service.repository.sync_watchlist_from_plans()
         return {"synced": synced}
@@ -212,6 +244,13 @@ class ToolRegistry:
         if isinstance(symbols, str):
             symbols = [item.strip() for item in symbols.split(",") if item.strip()]
         return {"quotes": self.service.fetch_quotes(list(symbols))}
+
+    def _kline_update(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self.service.update_kline_db()
+
+    def _event_cleanup(self, args: dict[str, Any]) -> dict[str, Any]:
+        deleted = self.service.repository.cleanup_events(int(args.get("max_days") or 30), int(args.get("max_count") or 10000))
+        return {"deleted": deleted}
 
     def _schedule_create(self, args: dict[str, Any]) -> dict[str, Any]:
         schedule = ScheduleSpec(**args)

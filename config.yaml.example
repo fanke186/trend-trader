@@ -1,0 +1,89 @@
+# trend-trader configuration
+# Copy to backend/.data/config.yaml for local overrides.
+
+active:
+  quote_channel: mootdx
+  trade_mode: dry_run
+  notify_channel: hermes
+  ai_profile: deepseek
+
+ai:
+  profiles:
+    - name: deepseek
+      provider: deepseek
+      base_url: https://api.deepseek.com
+      api_key_env: DEEPSEEK_API_KEY
+      model: deepseek-v4-pro
+      temperature: 0.2
+      max_tokens: 4096
+      timeout_seconds: 60
+      extra:
+        reasoning_effort: high
+      active: true
+    - name: glm
+      provider: glm
+      base_url: https://open.bigmodel.cn/api/paas/v4
+      api_key_env: ZAI_API_KEY
+      model: glm-5.1
+      temperature: 0.2
+      max_tokens: 4096
+      active: false
+    - name: openai
+      provider: openai
+      base_url: https://api.openai.com/v1
+      api_key_env: OPENAI_API_KEY
+      model: gpt-5
+      temperature: 0.2
+      max_tokens: 4096
+      active: false
+
+quote:
+  mootdx:
+    enabled: true
+    market: std
+    multithread: true
+    heartbeat: true
+    timeout_seconds: 5
+    retry: 3
+  jvquant:
+    enabled: false
+    token_env: JVQUANT_TOKEN
+    default_level: lv1
+    alloc_url: https://jvquant.com/alloc
+    timeout_seconds: 10
+    reconnect_seconds: 3
+
+trading:
+  mode: dry_run
+  miniqmt:
+    gateway_url: http://192.168.1.100:8800
+    timeout_seconds: 10
+    retry: 3
+    max_position_pct: 0.3
+    max_daily_loss: 5000
+    max_consecutive_loss: 3
+  paper:
+    initial_cash: 100000
+    commission_rate: 0.00025
+    stamp_duty: 0.001
+    min_commission: 5
+
+notify:
+  hermes:
+    enabled: true
+    binary: /Users/yaya/.local/bin/hermes
+    send_env: TREND_TRADER_HERMES_SEND
+  wechat:
+    enabled: false
+    webhook_url_env: WECHAT_WEBHOOK_URL
+  dingtalk:
+    enabled: false
+    webhook_url_env: DINGTALK_WEBHOOK_URL
+    secret_env: DINGTALK_SECRET
+
+kline_db:
+  db_path: kline.duckdb
+  parquet_dir: kline_parquet
+  years_back: 15
+  frequencies: [1d, 1w, 1M]
+  auto_update_after: "15:30"

@@ -1,81 +1,96 @@
 import { useEffect, useRef } from 'react'
-import { dispose, init } from 'klinecharts'
+import { CandlestickSeries, ColorType, HistogramSeries, createChart } from 'lightweight-charts'
+import type { IChartApi, ISeriesApi, Time } from 'lightweight-charts'
 import type { StrategyAnalysis } from './types'
 
-type ChartApi = {
-  setSymbol: (symbol: unknown) => void
-  setPeriod: (period: unknown) => void
-  setDataLoader: (loader: unknown) => void
-  createIndicator?: (indicator: unknown) => void
-  createOverlay?: (overlay: unknown) => void
-  removeOverlay?: (filter?: unknown) => void
-}
-
-function toTimestamp(date: string): number {
-  return new Date(`${date}T00:00:00+08:00`).getTime()
-}
-
-function overlayToKLine(overlay: StrategyAnalysis['overlays'][number]) {
-  return {
-    id: overlay.id,
-    name: overlay.name,
-    lock: true,
-    points: overlay.points.map(point => ({
-      timestamp: toTimestamp(point.date),
-      value: point.value
-    })),
-    styles: overlay.styles,
-    extendData: {
-      label: overlay.label,
-      kind: overlay.kind
-    }
-  }
+function toTime(date: string): Time {
+  return date as Time
 }
 
 export function KLinePanel({ analysis }: { analysis: StrategyAnalysis | null }) {
-  const chartRef = useRef<ChartApi | null>(null)
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const chartRef = useRef<IChartApi | null>(null)
+  const candleRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
+  const volumeRef = useRef<ISeriesApi<'Histogram'> | null>(null)
 
   useEffect(() => {
-    const chart = init('trend-kline') as ChartApi | null
-    if (!chart) {
-      return
-    }
+    if (!containerRef.current) return
+    const chart = createChart(containerRef.current, {
+      height: 420,
+      layout: {
+        background: { type: ColorType.Solid, color: '#0a0d14' },
+        textColor: '#94a3b8'
+      },
+      grid: {
+        vertLines: { color: '#1a1f2e' },
+        horzLines: { color: '#1a1f2e' }
+      },
+      rightPriceScale: { borderColor: '#1a1f2e' },
+      timeScale: { borderColor: '#1a1f2e' }
+    })
     chartRef.current = chart
-    chart.setPeriod({ span: 1, type: 'day' })
-    chart.createIndicator?.({ name: 'VOL', paneId: 'volume_pane' })
+    candleRef.current = chart.addSeries(CandlestickSeries, {
+      upColor: '#00d4aa',
+      downColor: '#ff4757',
+      borderUpColor: '#00d4aa',
+      borderDownColor: '#ff4757',
+      wickUpColor: '#00d4aa',
+      wickDownColor: '#ff4757'
+    })
+    volumeRef.current = chart.addSeries(HistogramSeries, {
+      priceFormat: { type: 'volume' },
+      priceScaleId: '',
+      color: '#38bdf8'
+    })
+    volumeRef.current.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } })
 
+    const resize = () => {
+      if (containerRef.current) {
+        chart.applyOptions({ width: containerRef.current.clientWidth })
+      }
+    }
+    resize()
+    window.addEventListener('resize', resize)
     return () => {
-      dispose('trend-kline')
+      window.removeEventListener('resize', resize)
+      chart.remove()
       chartRef.current = null
+      candleRef.current = null
+      volumeRef.current = null
     }
   }, [])
 
   useEffect(() => {
-    const chart = chartRef.current
-    if (!chart || !analysis) {
-      return
-    }
-    chart.setSymbol({ ticker: `${analysis.symbol}.${analysis.bars.at(-1)?.exchange ?? ''}` })
-    chart.setDataLoader({
-      getBars: ({ callback }: { callback: (bars: unknown[]) => void }) => {
-        callback(
-          analysis.bars.map(bar => ({
-            timestamp: toTimestamp(bar.date),
-            open: bar.open,
-            high: bar.high,
-            low: bar.low,
-            close: bar.close,
-            volume: bar.volume,
-            turnover: bar.turnover
-          }))
-        )
+    if (!analysis || !candleRef.current || !volumeRef.current || !chartRef.current) return
+    candleRef.current.setData(
+      analysis.bars.map(bar => ({
+        time: toTime(bar.date),
+        open: bar.open,
+        high: bar.high,
+        low: bar.low,
+        close: bar.close
+      }))
+    )
+    volumeRef.current.setData(
+      analysis.bars.map(bar => ({
+        time: toTime(bar.date),
+        value: bar.volume,
+        color: bar.close >= bar.open ? '#00d4aa55' : '#ff475755'
+      }))
+    )
+    analysis.overlays.forEach(overlay => {
+      const point = overlay.points[0]
+      if (point && (overlay.kind === 'entry' || overlay.kind === 'stop')) {
+        candleRef.current?.createPriceLine({
+          price: point.value,
+          color: overlay.kind === 'entry' ? '#38bdf8' : '#ff4757',
+          lineWidth: 1,
+          title: overlay.label
+        })
       }
     })
-    chart.removeOverlay?.()
-    analysis.overlays.forEach(overlay => {
-      chart.createOverlay?.(overlayToKLine(overlay))
-    })
+    chartRef.current.timeScale().fitContent()
   }, [analysis])
 
-  return <div id="trend-kline" className="kline" />
+  return <div ref={containerRef} className="h-[420px] w-full overflow-hidden rounded-md border border-base-800 bg-base-900" />
 }

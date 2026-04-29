@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -46,6 +47,7 @@ app.add_middleware(
 )
 
 alert_clients: set[WebSocket] = set()
+quote_clients: set[WebSocket] = set()
 
 
 @app.get("/api/health")
@@ -226,6 +228,32 @@ def draft_strategy_spec(payload: dict):
     return service.repository.save_generic("strategy_specs", strategy.model_dump(mode="json"))
 
 
+@app.post("/api/strategies/{strategy_id}/explain")
+def explain_strategy(strategy_id: int):
+    try:
+        return service.explain_strategy(strategy_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/strategies/{strategy_id}/backtest")
+def run_strategy_backtest(strategy_id: int, payload: dict):
+    try:
+        return service.run_backtest(
+            strategy_id,
+            str(payload.get("symbol") or "000001"),
+            payload.get("start_date"),
+            payload.get("end_date"),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/strategies/{strategy_id}/backtests")
+def list_strategy_backtests(strategy_id: int):
+    return service.list_backtests(strategy_id)
+
+
 @app.get("/api/pools")
 def list_pools():
     return service.repository.list_pools()
@@ -253,6 +281,11 @@ def save_condition_order(order: ConditionOrder):
     service.validate_condition(order.condition)
     order.symbol = service.normalize_symbol(order.symbol)
     return service.repository.save_condition_order(order)
+
+
+@app.post("/api/condition-orders/ai-create")
+def ai_create_condition_order(payload: dict):
+    return service.ai_create_condition_order(str(payload.get("symbol") or ""), str(payload.get("description") or ""))
 
 
 @app.post("/api/condition-orders/{order_id}/enable")
@@ -306,6 +339,36 @@ def fetch_quotes(symbols: str):
     return service.fetch_quotes([item.strip() for item in symbols.split(",") if item.strip()])
 
 
+@app.get("/api/monitor/quotes/stream")
+def quote_stream_info():
+    return {"websocket": "/ws/quotes"}
+
+
+@app.get("/api/kline/symbols")
+def list_kline_symbols():
+    return service.list_kline_symbols()
+
+
+@app.get("/api/kline/{symbol}")
+def get_kline(symbol: str, frequency: str = "1d", limit: int = 500):
+    return service.get_kline_bars(symbol, frequency, limit)
+
+
+@app.get("/api/trading/status")
+def trading_status():
+    return service.trading_status()
+
+
+@app.get("/api/config")
+def get_config():
+    return service.config_view()
+
+
+@app.post("/api/config/reload")
+def reload_config():
+    return service.reload_config()
+
+
 @app.post("/api/notifications/hermes/test")
 def test_hermes_notification(payload: dict):
     return service.notify_hermes(str(payload.get("message") or "trend-trader test"), dry_run=bool(payload.get("dry_run", True)))
@@ -352,6 +415,33 @@ async def alerts_ws(websocket: WebSocket) -> None:
             await websocket.receive_text()
     except WebSocketDisconnect:
         alert_clients.discard(websocket)
+
+
+@app.websocket("/ws/quotes")
+async def quotes_ws(websocket: WebSocket) -> None:
+    await websocket.accept()
+    quote_clients.add(websocket)
+    symbols: list[str] = []
+    try:
+        while True:
+            try:
+                text = await asyncio.wait_for(websocket.receive_text(), timeout=3)
+                payload = json.loads(text) if text else {}
+                if isinstance(payload, dict) and payload.get("symbols"):
+                    raw_symbols = payload.get("symbols")
+                    if isinstance(raw_symbols, str):
+                        symbols = [item.strip() for item in raw_symbols.split(",") if item.strip()]
+                    else:
+                        symbols = [str(item) for item in raw_symbols]
+            except asyncio.TimeoutError:
+                if not symbols:
+                    orders = service.repository.list_generic("condition_orders")
+                    symbols = sorted({str(order.get("symbol")) for order in orders if order.get("enabled", True) and order.get("symbol")})
+                quotes = service.fetch_quotes(symbols or ["000001", "002261"])
+                for quote in quotes:
+                    await websocket.send_json({"type": "quote", "data": quote})
+    except WebSocketDisconnect:
+        quote_clients.discard(websocket)
 
 
 async def _broadcast_alert(alert: AlertEvent) -> None:

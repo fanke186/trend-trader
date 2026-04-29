@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./backend/.data:/app/.data
+    environment:
+      - TREND_TRADER_HERMES_SEND=0
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m app.cli worker start
+    volumes:
+      - ./backend/.data:/app/.data
+    environment:
+      - TREND_TRADER_HERMES_SEND=0
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_TARGET=http://backend:8001

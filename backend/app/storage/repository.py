@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,7 @@ from app.models import (
     StrategyAnalysis,
     TradePlan,
 )
+from app.storage.migrations import MigrationRunner
 
 
 GENERIC_TABLES = {
@@ -38,6 +39,7 @@ class Repository:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        MigrationRunner(db_path).run()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -351,23 +353,49 @@ class Repository:
         payload = analysis.model_dump_json()
         now = datetime.utcnow().isoformat()
         with self._connect() as conn:
-            conn.execute(
-                """
-                insert into analyses(symbol, strategy_name, as_of, score, status, payload, created_at)
-                values (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    analysis.symbol,
-                    analysis.strategy_name,
-                    analysis.as_of.isoformat(),
-                    analysis.score,
-                    analysis.status,
-                    payload,
-                    now,
-                ),
-            )
-        if analysis.trade_plan:
-            self.save_plan(analysis.trade_plan)
+            try:
+                conn.execute("begin")
+                conn.execute(
+                    """
+                    insert into analyses(symbol, strategy_name, as_of, score, status, payload, created_at)
+                    values (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        analysis.symbol,
+                        analysis.strategy_name,
+                        analysis.as_of.isoformat(),
+                        analysis.score,
+                        analysis.status,
+                        payload,
+                        now,
+                    ),
+                )
+                if analysis.trade_plan:
+                    plan = analysis.trade_plan
+                    conn.execute(
+                        """
+                        insert into plans(
+                            symbol, strategy_name, status, entry_price, stop_loss, take_profit,
+                            risk_reward_ratio, payload, created_at
+                        )
+                        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            plan.symbol,
+                            plan.strategy_name,
+                            plan.status,
+                            plan.entry_price,
+                            plan.stop_loss,
+                            plan.take_profit,
+                            plan.risk_reward_ratio,
+                            plan.model_dump_json(),
+                            plan.created_at.isoformat(),
+                        ),
+                    )
+                conn.execute("commit")
+            except Exception:
+                conn.execute("rollback")
+                raise
 
     def save_plan(self, plan: TradePlan) -> None:
         with self._connect() as conn:
@@ -866,6 +894,43 @@ class Repository:
             payload["created_at"] = row["created_at"]
             result.append(payload)
         return result
+
+    def cleanup_events(self, max_days: int = 30, max_count: int = 10000) -> int:
+        cutoff = (datetime.utcnow() - timedelta(days=max_days)).isoformat()
+        deleted = 0
+        with self._connect() as conn:
+            deleted = int(conn.execute("delete from events where created_at < ?", (cutoff,)).rowcount or 0)
+            count = int(conn.execute("select count(*) from events").fetchone()[0])
+            if count > max_count:
+                excess = count - max_count
+                deleted += int(
+                    conn.execute(
+                        "delete from events where id in (select id from events order by created_at asc limit ?)",
+                        (excess,),
+                    ).rowcount
+                    or 0
+                )
+        return deleted
+
+    def save_backtest_run(self, strategy_spec_id: int, symbol: str, start_date: str, end_date: str, status: str, payload: dict[str, Any]) -> dict[str, Any]:
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                insert into backtest_runs(strategy_spec_id, symbol, start_date, end_date, status, payload, created_at)
+                values (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (strategy_spec_id, symbol, start_date, end_date, status, self._json_dumps(payload), now),
+            )
+        return {"id": int(cur.lastrowid), "strategy_spec_id": strategy_spec_id, "symbol": symbol, "start_date": start_date, "end_date": end_date, "status": status, "payload": payload, "created_at": now}
+
+    def list_backtest_runs(self, strategy_spec_id: int, limit: int = 100) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "select * from backtest_runs where strategy_spec_id = ? order by created_at desc limit ?",
+                (strategy_spec_id, limit),
+            ).fetchall()
+        return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
 
     def save_schedule_run(self, run: ScheduleRun) -> dict[str, Any]:
         with self._connect() as conn:

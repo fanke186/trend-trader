@@ -1,21 +1,16 @@
-import { defineConfig } from 'vite'
+import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
-import path from 'node:path'
+import tailwindcss from '@tailwindcss/vite'
 
-const apiTarget = process.env.VITE_API_TARGET ?? 'http://127.0.0.1:8000'
+const apiTarget = process.env.VITE_API_TARGET ?? 'http://127.0.0.1:8001'
 const wsTarget = apiTarget.replace(/^http/, 'ws')
 
 export default defineConfig({
-  plugins: [react()],
-  resolve: {
-    alias: {
-      klinecharts: path.resolve(__dirname, '../../KLineChart/src/index.ts')
-    }
+  plugins: [react(), tailwindcss()],
+  test: {
+    environment: 'jsdom'
   },
   server: {
-    fs: {
-      allow: [path.resolve(__dirname, '..'), path.resolve(__dirname, '../../KLineChart')]
-    },
     proxy: {
       '/api': apiTarget,
       '/ws': {

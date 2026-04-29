@@ -50,6 +50,12 @@ export type StrategyAnalysis = {
   trade_plan: TradePlan | null
 }
 
+export type ScreenerResult = {
+  strategy_name: string
+  generated_at: string
+  results: StrategyAnalysis[]
+}
+
 export type AlertEvent = {
   id: number
   symbol: string
@@ -109,6 +115,15 @@ export type ToolDefinition = {
   category: string
 }
 
+export type ToolInvokeResult = {
+  tool_name: string
+  status: 'ok' | 'error' | 'confirmation_required'
+  output: Record<string, unknown>
+  error?: string | null
+  requires_confirmation: boolean
+  invocation_id?: number | null
+}
+
 export type ChatSession = {
   id: number
   title: string
@@ -156,6 +171,45 @@ export type ConditionOrder = {
   enabled: boolean
   status: string
   last_triggered_at?: string | null
+}
+
+export type Quote = {
+  symbol: string
+  name: string
+  price: number
+  change_pct: number
+  volume: number
+  amount?: number
+  high?: number
+  low?: number
+  open?: number
+  pre_close?: number
+  timestamp?: number
+  source?: string
+  at?: string
+}
+
+export type StrategySpec = {
+  id: number
+  name: string
+  description: string
+  source_prompt: string
+  version: number
+  universe: Record<string, unknown>
+  features: Record<string, unknown>[]
+  filters: Record<string, unknown>[]
+  scoring: Record<string, unknown>[]
+  overlays: Record<string, unknown>[]
+  trade_plan_template: Record<string, unknown>
+  explanation: string
+  enabled: boolean
+}
+
+export type TradingStatus = {
+  mode: string
+  asset: Record<string, unknown>
+  positions: Record<string, unknown>[]
+  orders: Record<string, unknown>[]
 }
 
 export type ScheduleSpec = {

@@ -4,14 +4,20 @@ import type {
   ChatMessage,
   ChatSession,
   ConditionOrder,
+  DailyBar,
   EventRecord,
   ModelProfile,
   ModelProvider,
   ScheduleSpec,
   SkillSpec,
+  ScreenerResult,
   StockPool,
   StockPoolItem,
+  StrategySpec,
   StrategyAnalysis,
+  ToolInvokeResult,
+  TradingStatus,
+  Quote,
   ToolDefinition
 } from './types'
 
@@ -31,7 +37,7 @@ export async function analyze(symbol: string, strategyName: string): Promise<Str
   })
 }
 
-export async function runScreener(symbols: string[], strategyName: string): Promise<{ results: StrategyAnalysis[] }> {
+export async function runScreener(symbols: string[], strategyName: string): Promise<ScreenerResult> {
   return request('/api/screener/run', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -73,7 +79,7 @@ export const sendChatMessage = (sessionId: number, content: string, agentId?: nu
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ content, agent_id: agentId ?? null })
 })
-export const invokeTool = (name: string, args: Record<string, unknown>, confirmed = false) => request<Record<string, unknown>>('/api/tools/invoke', {
+export const invokeTool = (name: string, args: Record<string, unknown>, confirmed = false) => request<ToolInvokeResult>('/api/tools/invoke', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ name, arguments: args, confirmed, source: 'frontend' })
@@ -94,4 +100,23 @@ export const fetchSchedules = () => request<ScheduleSpec[]>('/api/schedules')
 export const runSchedule = (id: number) => request<Record<string, unknown>>(`/api/schedules/${id}/run`, { method: 'POST' })
 export const setScheduleEnabled = (id: number, enabled: boolean) => request<ScheduleSpec>(`/api/schedules/${id}/${enabled ? 'enable' : 'disable'}`, { method: 'POST' })
 export const fetchEvents = () => request<EventRecord[]>('/api/events')
-export const fetchQuotes = (symbols: string[]) => request<Record<string, unknown>[]>(`/api/monitor/quotes?symbols=${encodeURIComponent(symbols.join(','))}`)
+export const fetchQuotes = (symbols: string[]) => request<Quote[]>(`/api/monitor/quotes?symbols=${encodeURIComponent(symbols.join(','))}`)
+export const fetchStrategies = () => request<StrategySpec[]>('/api/strategies')
+export const explainStrategy = (id: number) => request<{ explanation: string; hash: string }>(`/api/strategies/${id}/explain`, { method: 'POST' })
+export const generateStrategy = (name: string, description: string) => request<ToolInvokeResult>('/api/tools/invoke', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ name: 'strategy.generate', arguments: { name, description }, confirmed: true, source: 'frontend' })
+}).then(result => {
+  const output = (result as ToolInvokeResult).output
+  return output.strategy as StrategySpec
+})
+export const aiCreateConditionOrder = (symbol: string, description: string) => request<ConditionOrder>('/api/condition-orders/ai-create', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ symbol, description })
+})
+export const fetchKline = (symbol: string, frequency = '1d', limit = 500) => request<DailyBar[]>(`/api/kline/${symbol}?frequency=${encodeURIComponent(frequency)}&limit=${limit}`)
+export const fetchTradingStatus = () => request<TradingStatus>('/api/trading/status')
+export const fetchConfig = () => request<{ path: string; config: Record<string, unknown> }>('/api/config')
+export const reloadConfig = () => request<{ path: string; config: Record<string, unknown> }>('/api/config/reload', { method: 'POST' })

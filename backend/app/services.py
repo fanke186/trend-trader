@@ -6,15 +6,19 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 
+from app.config import ConfigLoader
 from app.data.cache import BarCache
+from app.data.kline_db import KlineDatabase
 from app.data.providers import QuantAxisDailyBarProvider, normalize_symbol
 from app.data.realtime import EasyQuotationQuoteProvider
+from app.monitoring.condition_evaluator import ConditionEvaluator
+from app.monitoring.quote_stream import Quote, QuoteManager
 from app.models import (
     AgentRunResult,
     AgentSpec,
@@ -36,18 +40,30 @@ from app.models import (
 )
 from app.storage.repository import Repository
 from app.strategies import build_registry
+from app.strategies.engine import StrategyEngine
+from app.strategies.interpreter import StrategyInterpreter
 from app.tools import ToolRegistry
+from app.trading import TradeManager
 
 
 class TrendTraderService:
     def __init__(self, data_dir: Path) -> None:
         load_dotenv(data_dir.parent / ".env", override=False)
+        self.data_dir = data_dir
+        self.config = ConfigLoader(data_dir / "config.yaml")
         self.provider = QuantAxisDailyBarProvider()
         self.quote_provider = EasyQuotationQuoteProvider()
         self.cache = BarCache(data_dir / "bars")
         self.repository = Repository(data_dir / "trend_trader.sqlite3")
         self.registry = build_registry()
         self.tools = ToolRegistry(self)
+        kline_cfg = self.config.kline_db
+        self.kline_db = KlineDatabase(data_dir / str(kline_cfg.get("db_path") or "kline.duckdb"), data_dir / str(kline_cfg.get("parquet_dir") or "kline_parquet"))
+        self.condition_evaluator = ConditionEvaluator()
+        self.strategy_engine = StrategyEngine()
+        self.strategy_interpreter = StrategyInterpreter()
+        self.trade_manager = TradeManager(self.config)
+        self.quote_manager = QuoteManager(self.config, on_quote=self._handle_quote)
         self._seed_defaults()
 
     def normalize_symbol(self, symbol: str) -> str:
@@ -55,10 +71,17 @@ class TrendTraderService:
 
     def analyze(self, request: AnalyzeRequest) -> StrategyAnalysis:
         symbol = normalize_symbol(request.symbol)
-        bars = self.provider.fetch_daily_bars(symbol)
+        bars = self.kline_db.get_bars(symbol, "1d", limit=500)
+        if not bars:
+            bars = self.provider.fetch_daily_bars(symbol)
+            self.kline_db.update_bars("1d", bars)
         self.cache.save(symbol, bars)
-        strategy = self.registry.get(request.strategy_name)
-        analysis = strategy.analyze(symbol, bars)
+        strategy_specs = [spec for spec in self.repository.list_generic("strategy_specs") if spec.get("name") == request.strategy_name]
+        if strategy_specs:
+            analysis = self.strategy_engine.execute(StrategySpec(**strategy_specs[0]), bars)
+        else:
+            strategy = self.registry.get(request.strategy_name)
+            analysis = strategy.analyze(symbol, bars)
         self.repository.save_analysis(analysis)
         return analysis
 
@@ -69,7 +92,10 @@ class TrendTraderService:
         return ScreenerResult(strategy_name=request.strategy_name, results=filtered)
 
     def fetch_quotes(self, symbols: list[str]) -> list[dict[str, Any]]:
-        return self.quote_provider.fetch_quotes(symbols)
+        try:
+            return self.quote_manager.fetch_once(symbols)
+        except Exception:
+            return self.quote_provider.fetch_quotes(symbols)
 
     def _seed_defaults(self) -> None:
         providers = [
@@ -237,6 +263,17 @@ class TrendTraderService:
                 },
                 "status": "disabled",
             },
+            {
+                "name": "K线数据更新",
+                "description": "每个交易日 15:30 自动更新全市场K线数据。",
+                "trigger": {"type": "cron", "cron": "30 15 * * 1-5", "timezone": "Asia/Shanghai"},
+                "workflow": {
+                    "version": 1,
+                    "description": "Update kline database after market close.",
+                    "steps": [{"type": "tool", "name": "kline.update", "arguments": {}}],
+                },
+                "status": "disabled",
+            },
         ]
         for item in defaults:
             try:
@@ -329,6 +366,40 @@ class TrendTraderService:
             return str(content)
         return json.dumps(message or body, ensure_ascii=False)[:2000]
 
+    def _call_llm_raw(
+        self,
+        provider: dict[str, Any],
+        profile: dict[str, Any],
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        base_url = str(provider.get("base_url") or "").rstrip("/")
+        if not base_url:
+            raise ValueError("provider base_url is empty")
+        api_key = os.getenv(str(provider.get("api_key_env") or ""), "")
+        payload: dict[str, Any] = {
+            "model": profile["model"],
+            "messages": messages,
+            "temperature": float(profile.get("temperature") or 0.2),
+            "max_tokens": int(profile.get("max_tokens") or 4096),
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        payload.update(dict(profile.get("extra") or {}))
+        request = urllib.request.Request(
+            f"{base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key or 'ollama'}"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=int(profile.get("timeout_seconds") or 60)) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"LLM API error {exc.code}: {detail[:500]}") from exc
+
     def generate_skill(self, request: GenerateSkillRequest) -> SkillSpec:
         instructions = (
             f"Purpose: {request.description}\n\n"
@@ -356,24 +427,25 @@ class TrendTraderService:
         status = "ok"
         try:
             if provider and profile and (os.getenv(str(provider.get("api_key_env") or "")) or provider.get("provider_type") == "ollama"):
-                text = self._call_openai_compatible(
-                    provider=provider,
-                    profile=profile,
-                    messages=[
-                        {"role": "system", "content": str(agent.get("system_prompt") or "")},
-                        {"role": "user", "content": prompt},
-                    ],
-                )
-                output = {"text": text, "mode": "model", "model": profile.get("model"), "provider": provider.get("name")}
+                from app.agent.tool_loop import AgentToolLoop
+
+                loop = AgentToolLoop(self.tools)
+
+                def llm_caller(messages, tools):
+                    return self._call_llm_raw(provider, profile, messages, tools)
+
+                output = loop.run(agent, prompt, context, llm_caller)
+                output.update({"mode": "model", "model": profile.get("model"), "provider": provider.get("name")})
             else:
                 output = {
                     "text": self._local_agent_response(agent, prompt, context),
                     "mode": "local",
                     "reason": "no usable model API key configured",
+                    "tool_calls": [],
                 }
         except Exception as exc:
             status = "error"
-            output = {"error": str(exc), "text": self._local_agent_response(agent, prompt, context), "mode": "fallback"}
+            output = {"error": str(exc), "text": self._local_agent_response(agent, prompt, context), "mode": "fallback", "tool_calls": []}
 
         run_id = self.repository.save_ai_run(agent_id, None, status, {"prompt": prompt, "context": context}, output)
         return AgentRunResult(id=run_id, agent_id=agent_id, status=status, input={"prompt": prompt, "context": context}, output=output)
@@ -403,7 +475,7 @@ class TrendTraderService:
         )
 
     def validate_condition(self, condition: dict[str, Any]) -> None:
-        allowed = {"all", "any", "not", "gte", "lte", "gt", "lt", "eq", "crosses_above", "crosses_below"}
+        allowed = ConditionEvaluator.ALLOWED_OPS
         op = condition.get("op")
         if op not in allowed:
             raise ValueError(f"unsupported condition operator: {op}")
@@ -426,8 +498,9 @@ class TrendTraderService:
             if not payload.get("enabled", True) or normalize_symbol(str(payload.get("symbol", ""))) != symbol:
                 continue
             condition = dict(payload.get("condition") or {})
+            context = {"symbol": symbol, "last_price": price, "price": price}
             try:
-                fired = self._eval_condition(condition, {"last_price": price, "price": price})
+                fired = self.condition_evaluator.evaluate(condition, context)
             except Exception as exc:
                 self.repository.save_event(
                     EventRecord(
@@ -440,6 +513,8 @@ class TrendTraderService:
                     )
                 )
                 continue
+            finally:
+                self.condition_evaluator.update_context(context)
             if not fired:
                 continue
             today = datetime.utcnow().date().isoformat()
@@ -459,29 +534,22 @@ class TrendTraderService:
                 )
             )
             events.append(event)
+            if payload.get("order_type") == "order":
+                trade_result = self.trade_manager.execute_condition_trade(payload)
+                self.repository.save_event(
+                    EventRecord(
+                        category="trade",
+                        source=f"condition_order:{payload.get('id')}",
+                        title=f"条件单交易执行：{payload.get('name')}",
+                        message=str(trade_result.get("status") or "submitted"),
+                        status=str(trade_result.get("status") or "submitted"),
+                        payload=trade_result,
+                    )
+                )
         return events
 
     def _eval_condition(self, condition: dict[str, Any], context: dict[str, Any]) -> bool:
-        op = condition.get("op")
-        if op == "all":
-            return all(self._eval_condition(dict(item), context) for item in condition.get("conditions", []))
-        if op == "any":
-            return any(self._eval_condition(dict(item), context) for item in condition.get("conditions", []))
-        if op == "not":
-            return not self._eval_condition(dict(condition.get("condition") or {}), context)
-        left = self._operand(condition.get("left"), context)
-        right = self._operand(condition.get("right"), context)
-        if op in {"gte", "crosses_above"}:
-            return left >= right
-        if op in {"lte", "crosses_below"}:
-            return left <= right
-        if op == "gt":
-            return left > right
-        if op == "lt":
-            return left < right
-        if op == "eq":
-            return left == right
-        raise ValueError(f"unsupported condition operator: {op}")
+        return self.condition_evaluator.evaluate(condition, context)
 
     def _operand(self, value: Any, context: dict[str, Any]) -> float:
         if isinstance(value, dict) and "var" in value:
@@ -500,6 +568,15 @@ class TrendTraderService:
                 raise ValueError(f"unsupported workflow step type: {step_type}")
             if step_type == "tool" and step_name not in tool_names:
                 raise ValueError(f"unknown workflow tool: {step_name}")
+            step_args = step.get("arguments", {}) if isinstance(step, dict) else step.arguments
+            if step_type == "agent":
+                agent_id = int((step_args or {}).get("agent_id") or 0)
+                if agent_id:
+                    self.repository.get_generic("agents", agent_id)
+            if step_type == "team":
+                team_id = int((step_args or {}).get("team_id") or 0)
+                if team_id:
+                    self.repository.get_generic("agent_teams", team_id)
         return workflow_obj
 
     def run_workflow(self, workflow: WorkflowScript | dict[str, Any], source: str = "workflow") -> dict[str, Any]:
@@ -609,3 +686,137 @@ class TrendTraderService:
             "stdout": completed.stdout[-2000:],
             "stderr": completed.stderr[-2000:],
         }
+
+    def explain_strategy(self, strategy_id: int) -> dict[str, Any]:
+        payload = self.repository.get_generic("strategy_specs", strategy_id)
+        spec = StrategySpec(**payload)
+        explanation = self.strategy_interpreter.explain(spec)
+        payload["explanation"] = explanation
+        saved = self.repository.save_generic("strategy_specs", payload)
+        return {"strategy": saved, "explanation": explanation, "hash": self.strategy_interpreter.hash_spec(spec)}
+
+    def generate_strategy(self, name: str, description: str) -> dict[str, Any]:
+        spec = StrategySpec(
+            name=name,
+            description=description,
+            source_prompt=description,
+            features=[
+                {"name": "pivot_high_low", "params": {"window": 3}},
+                {"name": "support_resistance_lines", "params": {"window": 3}},
+                {"name": "volume_ratio_20d", "params": {"period": 20}},
+                {"name": "ma_cross", "params": {"fast": 5, "slow": 20}},
+            ],
+            filters=[{"op": "manual_review_required", "params": {}}],
+            scoring=[
+                {"name": "structure", "weight": 25},
+                {"name": "breakout", "weight": 30},
+                {"name": "volume", "weight": 20},
+                {"name": "trend", "weight": 25},
+            ],
+            overlays=[{"kind": "support_line"}, {"kind": "resistance_line"}, {"kind": "entry_marker"}, {"kind": "stop_marker"}],
+            trade_plan_template={"entry_reason": "满足策略条件后观察突破买点", "invalidated_if": "跌破支撑或止损位"},
+            explanation="",
+            enabled=False,
+        )
+        spec.explanation = self.strategy_interpreter.explain(spec)
+        return self.repository.save_generic("strategy_specs", spec.model_dump(mode="json"))
+
+    def ai_create_condition_order(self, symbol: str, description: str) -> dict[str, Any]:
+        import re
+
+        symbol = normalize_symbol(symbol)
+        numbers = [float(item) for item in re.findall(r"\d+(?:\.\d+)?", description)]
+        price = numbers[-1] if numbers else 0.0
+        op = "gte"
+        if any(token in description for token in ["跌破", "低于", "小于", "below", "<"]):
+            op = "lte"
+        if any(token in description for token in ["上穿", "突破", "cross"]):
+            op = "crosses_above"
+        if any(token in description for token in ["下穿"]):
+            op = "crosses_below"
+        order = {
+            "name": f"{symbol} {description[:40]}",
+            "symbol": symbol,
+            "order_type": "order" if any(token in description for token in ["买入", "卖出", "下单"]) else "notify",
+            "strategy_name": "trend_trading",
+            "condition": {"op": op, "left": {"var": "last_price"}, "right": price},
+            "action": {"notify": True},
+            "dedupe_key": f"{symbol}:{op}:{price}",
+        }
+        from app.models import ConditionOrder
+
+        condition_order = ConditionOrder(**order)
+        self.validate_condition(condition_order.condition)
+        return self.repository.save_condition_order(condition_order)
+
+    def get_kline_bars(self, symbol: str, frequency: str = "1d", limit: int = 500) -> list[dict[str, Any]]:
+        symbol = normalize_symbol(symbol)
+        bars = self.kline_db.get_bars(symbol, frequency, limit=limit)
+        if not bars:
+            bars = self.provider.fetch_daily_bars(symbol)
+            self.kline_db.update_bars("1d", bars)
+            if frequency != "1d":
+                bars = self.kline_db.get_bars(symbol, frequency, limit=limit)
+            else:
+                bars = bars[-limit:]
+        return [bar.model_dump(mode="json") for bar in bars[-limit:]]
+
+    def list_kline_symbols(self) -> list[dict[str, Any]]:
+        symbols = self.kline_db.get_all_symbols()
+        if symbols:
+            return symbols
+        defaults = ["000001", "002261", "600519", "300750", "601318"]
+        for symbol in defaults:
+            self.kline_db.update_bars("1d", self.provider.fetch_daily_bars(symbol))
+        return self.kline_db.get_all_symbols()
+
+    def update_kline_db(self) -> dict[str, Any]:
+        today = date.today()
+        if not self.kline_db.is_trade_day(today):
+            return {"status": "skipped", "reason": f"{today.isoformat()} is not a trade day"}
+        symbols = [item.get("code") for item in self.kline_db.get_all_symbols()]
+        if not symbols:
+            symbols = ["000001", "002261", "600519", "300750", "601318"]
+        updated = 0
+        for symbol in symbols:
+            if not symbol:
+                continue
+            bars = self.provider.fetch_daily_bars(str(symbol), end=today)
+            if bars:
+                self.kline_db.update_bars("1d", bars)
+                updated += 1
+        self.kline_db.aggregate_weekly(today)
+        self.kline_db.aggregate_monthly(today)
+        return {"status": "ok", "updated": updated, "date": today.isoformat()}
+
+    def run_backtest(self, strategy_id: int, symbol: str, start_date: str | None = None, end_date: str | None = None) -> dict[str, Any]:
+        spec_payload = self.repository.get_generic("strategy_specs", strategy_id)
+        spec = StrategySpec(**spec_payload)
+        bars = self.kline_db.get_bars(normalize_symbol(symbol), "1d", limit=1000)
+        if not bars:
+            bars = self.provider.fetch_daily_bars(symbol)
+        if start_date:
+            bars = [bar for bar in bars if bar.date >= date.fromisoformat(start_date)]
+        if end_date:
+            bars = [bar for bar in bars if bar.date <= date.fromisoformat(end_date)]
+        analysis = self.strategy_engine.execute(spec, bars)
+        payload = {"analysis": analysis.model_dump(mode="json"), "bar_count": len(bars)}
+        return self.repository.save_backtest_run(strategy_id, normalize_symbol(symbol), start_date or (bars[0].date.isoformat() if bars else ""), end_date or (bars[-1].date.isoformat() if bars else ""), "ok", payload)
+
+    def list_backtests(self, strategy_id: int) -> list[dict[str, Any]]:
+        return self.repository.list_backtest_runs(strategy_id)
+
+    def trading_status(self) -> dict[str, Any]:
+        return self.trade_manager.status()
+
+    def config_view(self) -> dict[str, Any]:
+        return {"path": str(self.config.path), "config": self.config.masked()}
+
+    def reload_config(self) -> dict[str, Any]:
+        self.config.reload()
+        self.trade_manager = TradeManager(self.config)
+        self.quote_manager = QuoteManager(self.config, on_quote=self._handle_quote)
+        return self.config_view()
+
+    def _handle_quote(self, quote: Quote) -> None:
+        self.evaluate_condition_orders(quote.symbol, quote.price)
