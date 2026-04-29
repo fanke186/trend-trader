@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>002261 趋势复盘</title>
+    <script src="https://cdn.jsdelivr.net/npm/klinecharts/dist/umd/klinecharts.min.js"></script>
+    <style>
+      body {
+        margin: 0;
+        background: #eef2f6;
+        color: #172033;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      main {
+        padding: 16px;
+      }
+      .top {
+        display: grid;
+        grid-template-columns: 1fr 340px;
+        gap: 14px;
+      }
+      .card {
+        background: #fff;
+        border: 1px solid #d8e0ea;
+        border-radius: 8px;
+        box-shadow: 0 1px 2px rgba(20, 30, 45, 0.06);
+      }
+      #chart {
+        width: 100%;
+        height: 720px;
+      }
+      aside {
+        padding: 14px;
+      }
+      h1 {
+        font-size: 20px;
+        margin: 0 0 12px;
+      }
+      h2 {
+        font-size: 15px;
+        margin: 18px 0 8px;
+      }
+      .score {
+        font-size: 52px;
+        font-weight: 750;
+        color: #b7791f;
+        line-height: 1;
+      }
+      .muted {
+        color: #667085;
+        font-size: 13px;
+      }
+      dl {
+        margin: 0;
+        display: grid;
+        gap: 6px;
+      }
+      div.row {
+        display: flex;
+        justify-content: space-between;
+        border-bottom: 1px solid #edf2f7;
+        padding-bottom: 5px;
+        gap: 12px;
+      }
+      dt {
+        color: #667085;
+      }
+      dd {
+        margin: 0;
+        font-weight: 650;
+        text-align: right;
+      }
+      .status {
+        display: inline-block;
+        margin-top: 8px;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: #fff7ed;
+        color: #9a3412;
+        font-size: 13px;
+      }
+      .error {
+        padding: 16px;
+        color: #b42318;
+      }
+      @media (max-width: 1000px) {
+        .top {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="top">
+        <section class="card">
+          <div id="chart"></div>
+        </section>
+        <aside class="card">
+          <h1>002261 · trend_trading</h1>
+          <div class="score" id="score">--</div>
+          <div class="muted" id="asof">加载中</div>
+          <span class="status" id="status">--</span>
+
+          <h2>策略指标</h2>
+          <dl id="metrics"></dl>
+
+          <h2>交易计划</h2>
+          <dl id="plan"></dl>
+        </aside>
+      </div>
+    </main>
+
+    <script>
+      const api = 'http://127.0.0.1:8000/api/analyze'
+      const chart = klinecharts.init('chart')
+
+      function ts(date) {
+        return new Date(`${date}T00:00:00+08:00`).getTime()
+      }
+
+      function row(k, v) {
+        return `<div class="row"><dt>${k}</dt><dd>${v ?? '-'}</dd></div>`
+      }
+
+      function overlayToChart(overlay) {
+        return {
+          id: overlay.id,
+          name: overlay.name,
+          lock: true,
+          points: overlay.points.map(point => ({
+            timestamp: ts(point.date),
+            value: point.value
+          })),
+          styles: overlay.styles
+        }
+      }
+
+      async function run() {
+        const response = await fetch(api, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ symbol: '002261', strategy_name: 'trend_trading' })
+        })
+        if (!response.ok) {
+          throw new Error(await response.text())
+        }
+        const data = await response.json()
+        document.getElementById('score').textContent = data.score.toFixed(2)
+        document.getElementById('asof').textContent = `截至 ${data.as_of} · ${data.bars.length} 根日K`
+        document.getElementById('status').textContent = data.status
+        document.getElementById('metrics').innerHTML = Object.entries(data.metrics)
+          .map(([k, v]) => row(k, v))
+          .join('')
+        document.getElementById('plan').innerHTML = [
+          row('买点', data.trade_plan?.entry_price),
+          row('止损', data.trade_plan?.stop_loss),
+          row('止盈', data.trade_plan?.take_profit),
+          row('盈亏比', data.trade_plan?.risk_reward_ratio),
+          row('失效条件', data.trade_plan?.invalidated_if)
+        ].join('')
+
+        chart.setSymbol({ ticker: '002261.SZSE' })
+        const chartBars = data.bars.map(bar => ({
+          timestamp: ts(bar.date),
+          open: bar.open,
+          high: bar.high,
+          low: bar.low,
+          close: bar.close,
+          volume: bar.volume,
+          turnover: bar.turnover
+        }))
+        chart.setPeriod({ span: 1, type: 'day' })
+        chart.setDataLoader({
+          getBars: ({ callback }) => callback(chartBars)
+        })
+        chart.createIndicator('VOL')
+        data.overlays.forEach(overlay => chart.createOverlay(overlayToChart(overlay)))
+      }
+
+      run().catch(error => {
+        document.body.innerHTML = `<pre class="error">${error.message}</pre>`
+      })
+    </script>
+  </body>
+</html>

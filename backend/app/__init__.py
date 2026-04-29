@@ -1,0 +1,1 @@
+"""Trend trader backend package."""
