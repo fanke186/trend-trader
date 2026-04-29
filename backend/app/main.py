@@ -50,6 +50,26 @@ alert_clients: set[WebSocket] = set()
 quote_clients: set[WebSocket] = set()
 
 
+async def _broadcast_quotes(quote) -> None:
+    """Push a quote to all connected WebSocket clients."""
+    from app.monitoring.quote_stream import Quote
+    quote_data = quote.model_dump() if isinstance(quote, Quote) else quote
+    dead: list[WebSocket] = []
+    for client in quote_clients:
+        try:
+            await client.send_json({"type": "quote", "data": quote_data})
+        except Exception:
+            dead.append(client)
+    for client in dead:
+        quote_clients.discard(client)
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    service.set_quote_broadcaster(_broadcast_quotes)
+    asyncio.create_task(service.start_quote_loop())
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -421,11 +441,10 @@ async def alerts_ws(websocket: WebSocket) -> None:
 async def quotes_ws(websocket: WebSocket) -> None:
     await websocket.accept()
     quote_clients.add(websocket)
-    symbols: list[str] = []
     try:
         while True:
             try:
-                text = await asyncio.wait_for(websocket.receive_text(), timeout=3)
+                text = await asyncio.wait_for(websocket.receive_text(), timeout=30)
                 payload = json.loads(text) if text else {}
                 if isinstance(payload, dict) and payload.get("symbols"):
                     raw_symbols = payload.get("symbols")
@@ -433,13 +452,9 @@ async def quotes_ws(websocket: WebSocket) -> None:
                         symbols = [item.strip() for item in raw_symbols.split(",") if item.strip()]
                     else:
                         symbols = [str(item) for item in raw_symbols]
+                    service.quote_manager.add_symbols(set(symbols))
             except asyncio.TimeoutError:
-                if not symbols:
-                    orders = service.repository.list_generic("condition_orders")
-                    symbols = sorted({str(order.get("symbol")) for order in orders if order.get("enabled", True) and order.get("symbol")})
-                quotes = service.fetch_quotes(symbols or ["000001", "002261"])
-                for quote in quotes:
-                    await websocket.send_json({"type": "quote", "data": quote})
+                pass
     except WebSocketDisconnect:
         quote_clients.discard(websocket)
 

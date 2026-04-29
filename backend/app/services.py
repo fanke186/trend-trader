@@ -64,6 +64,7 @@ class TrendTraderService:
         self.strategy_interpreter = StrategyInterpreter()
         self.trade_manager = TradeManager(self.config)
         self.quote_manager = QuoteManager(self.config, on_quote=self._handle_quote)
+        self._quote_broadcaster = None
         self._seed_defaults()
 
     def normalize_symbol(self, symbol: str) -> str:
@@ -377,16 +378,16 @@ class TrendTraderService:
         if not base_url:
             raise ValueError("provider base_url is empty")
         api_key = os.getenv(str(provider.get("api_key_env") or ""), "")
-        payload: dict[str, Any] = {
+        payload: dict[str, Any] = dict(profile.get("extra") or {})
+        payload.update({
             "model": profile["model"],
             "messages": messages,
             "temperature": float(profile.get("temperature") or 0.2),
             "max_tokens": int(profile.get("max_tokens") or 4096),
-        }
+        })
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-        payload.update(dict(profile.get("extra") or {}))
         request = urllib.request.Request(
             f"{base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -695,7 +696,77 @@ class TrendTraderService:
         saved = self.repository.save_generic("strategy_specs", payload)
         return {"strategy": saved, "explanation": explanation, "hash": self.strategy_interpreter.hash_spec(spec)}
 
+    def _resolve_active_llm(self) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Resolve the active AI provider and profile. Returns None if unavailable."""
+        profiles = self.repository.list_generic("model_profiles")
+        active_profile = next((p for p in profiles if p.get("enabled", True)), None)
+        if not active_profile:
+            return None
+        provider_id = int(active_profile.get("provider_id") or 0)
+        if not provider_id:
+            return None
+        try:
+            provider = self.repository.get_generic("model_providers", provider_id)
+        except KeyError:
+            return None
+        api_key_env = str(provider.get("api_key_env") or "")
+        if not os.getenv(api_key_env) and provider.get("provider_type") != "ollama":
+            return None
+        return provider, active_profile
+
     def generate_strategy(self, name: str, description: str) -> dict[str, Any]:
+        llm = self._resolve_active_llm()
+        if llm:
+            try:
+                return self._generate_strategy_llm(name, description, llm[0], llm[1])
+            except Exception:
+                pass
+        return self._generate_strategy_default(name, description)
+
+    def _generate_strategy_llm(self, name: str, description: str, provider: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+        prompt = f"""请根据以下自然语言描述，生成一个 A 股趋势交易策略的 JSON 配置。
+
+策略名称: {name}
+策略描述: {description}
+
+返回一个 JSON 对象，包含以下字段:
+- features: 特征列表，可用算子: pivot_high_low, support_resistance_lines, volume_ratio_20d, ma_cross, rsi, macd, breakout, daily_bars
+- filters: 筛选条件列表，可用算子: manual_review_required, volume_min, price_above_ma
+- scoring: 评分维度列表，可用算子: structure, breakout, volume, risk_reward, trend, momentum。每个维度需含 name 和 weight (整数, 总和应为100)
+- overlays: 图表覆盖层列表，可用类型: support_line, resistance_line, entry_marker, stop_marker
+- trade_plan_template: 含 entry_reason 和 invalidated_if 两个字符串字段
+
+只返回 JSON，不要有其他文字。"""
+
+        response = self._call_llm_raw(
+            provider, profile,
+            messages=[
+                {"role": "system", "content": "你是一个量化策略分析师。请根据用户需求生成策略配置 JSON。只返回 JSON 对象，不要包含其他文字或 markdown 标记。"},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = response["choices"][0]["message"]["content"]
+        # strip markdown code fences
+        content = content.strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1].rsplit("```", 1)[0] if content.endswith("```") else content.split("\n", 1)[-1]
+        parsed = json.loads(content)
+        spec = StrategySpec(
+            name=name,
+            description=description,
+            source_prompt=description,
+            features=list(parsed.get("features") or []),
+            filters=list(parsed.get("filters") or []),
+            scoring=list(parsed.get("scoring") or []),
+            overlays=list(parsed.get("overlays") or []),
+            trade_plan_template=dict(parsed.get("trade_plan_template") or {}),
+            explanation="",
+            enabled=False,
+        )
+        spec.explanation = self.strategy_interpreter.explain(spec)
+        return self.repository.save_generic("strategy_specs", spec.model_dump(mode="json"))
+
+    def _generate_strategy_default(self, name: str, description: str) -> dict[str, Any]:
         spec = StrategySpec(
             name=name,
             description=description,
@@ -722,9 +793,57 @@ class TrendTraderService:
         return self.repository.save_generic("strategy_specs", spec.model_dump(mode="json"))
 
     def ai_create_condition_order(self, symbol: str, description: str) -> dict[str, Any]:
+        symbol = normalize_symbol(symbol)
+        llm = self._resolve_active_llm()
+        if llm:
+            try:
+                return self._ai_create_condition_llm(symbol, description, llm[0], llm[1])
+            except Exception:
+                pass
+        return self._ai_create_condition_regex(symbol, description)
+
+    def _ai_create_condition_llm(self, symbol: str, description: str, provider: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+        prompt = f"""请根据以下自然语言描述，解析出条件单的配置 JSON。
+
+股票代码: {symbol}
+用户描述: {description}
+
+返回一个 JSON 对象，包含:
+- op: 条件算子 (gte=大于等于, lte=小于等于, gt=大于, lt=小于, crosses_above=上穿, crosses_below=下穿)
+- price: 触发价格 (数字)
+- order_type: "notify"(仅通知) 或 "order"(下单)，根据描述中是否含"买入/卖出/下单"判断
+- name: 条件单名称 (简短描述)
+
+只返回 JSON，不要有其他文字。"""
+
+        response = self._call_llm_raw(
+            provider, profile,
+            messages=[
+                {"role": "system", "content": "你是一个交易助手。请根据用户描述解析条件单参数。只返回 JSON 对象，不要包含其他文字或 markdown 标记。"},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = response["choices"][0]["message"]["content"].strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1].rsplit("```", 1)[0] if content.endswith("```") else content.split("\n", 1)[-1]
+        parsed = json.loads(content)
+        order = {
+            "name": str(parsed.get("name") or f"{symbol} {description[:40]}"),
+            "symbol": symbol,
+            "order_type": str(parsed.get("order_type") or "notify"),
+            "strategy_name": "trend_trading",
+            "condition": {"op": str(parsed.get("op") or "gte"), "left": {"var": "last_price"}, "right": float(parsed.get("price") or 0)},
+            "action": {"notify": True},
+            "dedupe_key": f"{symbol}:{parsed.get('op', 'gte')}:{parsed.get('price', 0)}",
+        }
+        from app.models import ConditionOrder
+        condition_order = ConditionOrder(**order)
+        self.validate_condition(condition_order.condition)
+        return self.repository.save_condition_order(condition_order)
+
+    def _ai_create_condition_regex(self, symbol: str, description: str) -> dict[str, Any]:
         import re
 
-        symbol = normalize_symbol(symbol)
         numbers = [float(item) for item in re.findall(r"\d+(?:\.\d+)?", description)]
         price = numbers[-1] if numbers else 0.0
         op = "gte"
@@ -744,7 +863,6 @@ class TrendTraderService:
             "dedupe_key": f"{symbol}:{op}:{price}",
         }
         from app.models import ConditionOrder
-
         condition_order = ConditionOrder(**order)
         self.validate_condition(condition_order.condition)
         return self.repository.save_condition_order(condition_order)
@@ -818,5 +936,26 @@ class TrendTraderService:
         self.quote_manager = QuoteManager(self.config, on_quote=self._handle_quote)
         return self.config_view()
 
-    def _handle_quote(self, quote: Quote) -> None:
+    def set_quote_broadcaster(self, broadcaster):
+        """Set an async callable that broadcasts a Quote to all WebSocket clients."""
+        self._quote_broadcaster = broadcaster
+
+    async def start_quote_loop(self) -> None:
+        """Start the quote manager's polling loop as a background task.
+
+        Seeds active symbols from enabled condition orders so condition
+        evaluation always runs even when no WebSocket client is connected.
+        """
+        self._seed_quote_symbols()
+        await self.quote_manager.start()
+
+    def _seed_quote_symbols(self) -> None:
+        orders = self.repository.list_generic("condition_orders")
+        symbols = {str(order["symbol"]) for order in orders if order.get("enabled", True) and order.get("symbol")}
+        if symbols:
+            self.quote_manager.set_active_symbols(symbols)
+
+    async def _handle_quote(self, quote: Quote) -> None:
         self.evaluate_condition_orders(quote.symbol, quote.price)
+        if self._quote_broadcaster:
+            await self._quote_broadcaster(quote)

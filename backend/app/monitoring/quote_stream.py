@@ -126,6 +126,11 @@ class QuoteManager:
     def set_active_symbols(self, symbols: set[str]) -> None:
         self._active_symbols = {normalize_symbol(symbol) for symbol in symbols if symbol}
 
+    def add_symbols(self, symbols: set[str]) -> None:
+        for symbol in symbols:
+            if symbol:
+                self._active_symbols.add(normalize_symbol(symbol))
+
     def fetch_once(self, symbols: list[str] | None = None) -> list[dict[str, Any]]:
         target = symbols or sorted(self._active_symbols)
         quotes = self._provider.fetch_quotes(target)
@@ -136,12 +141,15 @@ class QuoteManager:
             if self._active_symbols:
                 quotes = self._provider.fetch_quotes(sorted(self._active_symbols))
                 for quote in quotes.values():
-                    self._on_quote(quote)
+                    await self._on_quote(quote)
             await asyncio.sleep(3)
 
-    def _on_quote(self, quote: Quote) -> None:
+    async def _on_quote(self, quote: Quote) -> None:
         if self._on_quote_callback:
-            self._on_quote_callback(quote)
+            result = self._on_quote_callback(quote)
+            import inspect
+            if inspect.isawaitable(result):
+                await result
 
 
 def _quote_from_bar(symbol: str, item: dict[str, Any], source: str) -> Quote:
