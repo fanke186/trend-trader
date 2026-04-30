@@ -4,15 +4,19 @@ A 股趋势交易系统本地版：每日复盘、趋势选股、盘中监控、
 
 ## 当前功能
 
-- `backend/`：FastAPI 后端，包含策略插件、日 K 数据适配、SQLite 持久化、股票池、条件单、事件中心、统一工具层和告警 WebSocket。
-- `frontend/`：Vite + React + KLineChart 前端，默认打开 AI 工作台，同时提供复盘、定时任务、股票池、条件单和事件页面。
-- 内置策略 `trend_trading`：裸 K 趋势策略，识别 pivot、高低点趋势线、关键位、突破买点、止损、止盈、盈亏比和综合评分。
-- AI 控制面：模型渠道、模型配置、Skill、Agent、Agent Team、聊天会话、工具调用审计。
-- 统一 `ToolRegistry`：前端、CLI、AI 对话、定时任务、MCP、Hermes/OpenClaw 外部调用都走同一套工具。
-- 定时任务：持久化 `WorkflowScript`，用 APScheduler worker 执行收盘复盘、开盘检查、监控准备等重复任务。
-- 盘中能力：`easyquotation` 行情适配、条件单 AST 校验、事件中心、Hermes 飞书通知 dry-run/真实发送适配。
-
-项目不直接修改 `QUANTAXIS`、`vnpy`、`KLineChart` 源码，只把它们作为外部依赖或适配对象。
+- `backend/`：FastAPI 后端，包含通用策略执行引擎、策略释义器、DuckDB K 线数据库、行情管理器、条件求值器、交易网关、Agent 工具循环、配置管理等。
+- `frontend/`：Vite + React 19 + Tailwind CSS 4 前端，Chat-First 布局（左侧导航 + 底部全局 ChatInput + 右侧上下文面板），React Router 7 多页面路由，lightweight-charts (TradingView) K 线渲染。
+- 通用策略引擎：输入 `StrategySpec` + K 线 → 自动计算 features → 应用 filters → 加权 scoring → 生成 overlays + trade_plan。
+- 策略释义器：对 StrategySpec 做 SHA256 哈希缓存，LLM 生成稳定自然语言释义，多次调用输出一致。
+- DuckDB K 线数据库：日/周/月 K，Parquet 按年分区存储，支持 QUANTAXIS → mootdx → sample 多级数据源降级。
+- 行情监控：mootdx（免费）/ jvQuant（付费）行情通道，异步轮询 + 条件单自动求值 + WebSocket 实时推送。
+- 条件单系统：all/any/not + gte/lte/gt/lt/eq/crosses_above/crosses_below 算子，支持通知/下单两种模式，触发后 Hermes 飞书通知。
+- 交易模块：TradingGateway 抽象层，支持 dry_run / paper（模拟撮合）/ live（MiniQMT Windows 网关）三种模式。
+- Agent 工具循环：LLM 工具调用闭环（最多 8 轮），自动调用 `ToolRegistry` 工具并返回结果。
+- 统一 `ToolRegistry`（17 个工具）：前端、CLI、AI 对话、定时任务、MCP 全部走同一套工具。
+- 定时任务：持久化 `WorkflowScript`，APScheduler worker 执行，内置 K 线数据自动更新 schedule。
+- Docker 支持：`docker-compose.yml` 一键启动 backend + worker + frontend。
+- 配置管理：YAML + 环境变量覆盖，支持多套 AI / 行情 / 交易配置通过 `active` 字段切换。
 
 ## 启动后端
 
@@ -105,10 +109,32 @@ Hermes 飞书通知默认 dry-run。如需真实发送：
 export TREND_TRADER_HERMES_SEND=1
 ```
 
+## Docker
+
+```bash
+# 一键启动 (backend + worker + frontend)
+docker-compose up -d
+
+# 查看日志
+docker-compose logs -f backend
+```
+
+本地开发仍推荐直接运行（见下方启动后端/前端章节）。
+
 ## 主要 API
 
 - `POST /api/analyze`：单票策略分析。
 - `POST /api/screener/run`：批量复盘选股。
+- `GET/POST /api/strategies`：策略列表/保存。
+- `POST /api/strategies/draft`：AI 生成策略草案。
+- `POST /api/strategies/{id}/explain`：策略自然语言释义（哈希缓存稳定输出）。
+- `POST /api/strategies/{id}/backtest`：运行策略回测。
+- `GET /api/strategies/{id}/backtests`：回测记录列表。
+- `GET /api/kline/{symbol}`：从 DuckDB 获取 K 线（支持 frequency=1d/1w/1M）。
+- `GET /api/kline/symbols`：证券列表。
+- `GET /api/trading/status`：交易状态（资产/持仓/委托）。
+- `GET /api/config`：查看当前配置（脱敏）。
+- `POST /api/config/reload`：重新加载配置。
 - `GET/POST /api/ai/providers`：模型渠道管理。
 - `GET/POST /api/ai/model-profiles`：模型配置管理。
 - `POST /api/ai/model-profiles/{id}/test`：测试模型配置。
@@ -116,10 +142,10 @@ export TREND_TRADER_HERMES_SEND=1
 - `POST /api/ai/skills/generate`：AI 生成 Skill 草案。
 - `GET/POST /api/ai/agents`：Agent 管理。
 - `GET/POST /api/ai/teams`：Agent Team 管理。
-- `POST /api/ai/agents/{id}/run`：运行单个 Agent。
+- `POST /api/ai/agents/{id}/run`：运行单个 Agent（使用 ToolLoop）。
 - `POST /api/ai/teams/{id}/run`：运行 Agent Team。
 - `GET/POST /api/chat/sessions`：AI 聊天会话。
-- `POST /api/chat/sessions/{id}/messages`：发送聊天消息，可用 `/tool 工具名 JSON参数` 调用系统工具。
+- `POST /api/chat/sessions/{id}/messages`：发送聊天消息。
 - `GET /api/tools`：查看可用工具。
 - `POST /api/tools/invoke`：调用统一工具。
 - `GET/POST /api/schedules`：定时任务管理。
@@ -127,13 +153,16 @@ export TREND_TRADER_HERMES_SEND=1
 - `GET /api/schedules/{id}/runs`：查看任务运行记录。
 - `GET/POST /api/pools`：股票池管理。
 - `GET/POST /api/condition-orders`：条件单管理。
+- `POST /api/condition-orders/ai-create`：AI 自然语言创建条件单。
 - `GET /api/events`：事件中心。
-- `GET /api/monitor/quotes`：获取实时行情，优先 easyquotation，失败时 sample fallback。
+- `GET /api/monitor/quotes`：获取实时行情（REST）。
+- `GET /api/monitor/quotes/stream`：行情 WebSocket 信息。
 - `GET /api/plans`：查看复盘生成的交易计划。
 - `POST /api/watchlist/sync`：同步交易计划到盘中监控。
-- `POST /api/watchlist/tick`：模拟或接入最新价格并触发提醒。
+- `POST /api/watchlist/tick`：推送价格并触发条件单求值。
 - `GET /api/alerts`：查看提醒记录。
 - `WS /ws/alerts`：实时提醒流。
+- `WS /ws/quotes`：实时行情推送（QuoteManager 统一推送）。
 - `WS /ws/chat/{session_id}`：聊天 WebSocket。
 
 ## 测试
